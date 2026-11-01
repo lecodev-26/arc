@@ -31,9 +31,13 @@ import (
 // CapabilityStreamClaims is advertised at join by a node that applies the
 // takeover rules and runs with cluster.stream_takeover (writers: and
 // cluster.wal_coverage). Earlier builds advertised stream_claims_v1 (S4a) and
-// stream_claims_v2 (S4b1a/b, no claimant, no exit on a claim) and never
-// enabled the flag; they block it.
-const CapabilityStreamClaims = "stream_claims_v3"
+// stream_claims_v2 (S4b1a/b, no claimant, no exit on a claim) and
+// stream_claims_v3 (S4b1c1: a leave still orphaned the leaving writer's
+// instances) and stream_claims_v4 (S4b1c2a1: no follow-up claims, no
+// tombstones, no abandon) and stream_claims_v5 (S4b1c2a2: a finished claim
+// still refused the origin's copies, orphaned instances were removed, no
+// vanished list) and never enabled the flag; they block it.
+const CapabilityStreamClaims = "stream_claims_v7"
 
 // Instance status, from its origin's announcements.
 const (
@@ -41,6 +45,11 @@ const (
 	InstanceAdopted  = "adopted"  // a previous process; the origin still holds its unflushed batches
 	InstanceClosed   = "closed"   // a previous process the origin, on the same disks, holds nothing of
 	InstanceOrphaned = "orphaned" // a previous process the origin cannot vouch for (new disks, removed node)
+	// InstanceRetired: an orphaned process every writer finished with. Its
+	// index is kept, so an origin that comes back with the volume the
+	// cluster wrote off can still publish, exactly, what nobody registered
+	// (#1207 S4b1c2b). Nothing claims it; its origin adopts it again.
+	InstanceRetired = "retired"
 )
 
 // Refusal kinds for a covered registration, in the order they are checked.
@@ -52,6 +61,10 @@ const (
 	// it would stop the index tracking the instance, and nothing could then
 	// arbitrate the origin's copies against the claimant's.
 	RefusedFull = "full"
+	// RefusedDeleted: a file holding batches a DELETE record covers that was
+	// not rewritten with that record (#1207 d1). The writer applies the
+	// record to it and proposes it again.
+	RefusedDeleted = "deleted"
 )
 
 // Bounds on the replicated takeover state, which every node keeps and
@@ -60,6 +73,7 @@ const (
 // today's behaviour for it, loudly.
 const (
 	maxTakeoverInstances       = 4096
+	maxTakeoverTombstones      = 4096
 	maxIndexEntries            = 1 << 20 // whole intervals + partial pieces + lost intervals, all instances
 	maxKeyIntervals            = 4096
 	maxKeyPartial              = 2048
@@ -74,6 +88,8 @@ const (
 	maxTakeoverReportedWriters = 256
 	maxCoverageEntries         = 8192 // ranges + partial pieces of one instance in one file
 	maxCoverageInstances       = 16   // instances in one file's coverage
+	maxRetiredInstances        = 256
+	maxVanishedPaths           = 1024
 )
 
 // CoveragePiece is part of one batch: a chunk of an oversized one and/or a
@@ -141,6 +157,9 @@ type StreamInstance struct {
 	Untracked   bool     `json:"untracked,omitempty"`
 	OriginGone  bool     `json:"origin_gone,omitempty"`
 	ReportedBy  []string `json:"reported_by,omitempty"` // writers that found nothing to claim of it
+	// RetiredAt is the log index the instance was retired at (the oldest
+	// retired instance is removed first past maxRetiredInstances).
+	RetiredAt uint64 `json:"retired_at,omitempty"`
 }
 
 // keyIndex is one (instance, key)'s settled batches: every batch at or below
@@ -150,6 +169,12 @@ type keyIndex struct {
 	Floor uint64               `json:"f,omitempty"`
 	Lost  Intervals            `json:"l,omitempty"`
 	Hours map[int64]*hourIndex `json:"h,omitempty"`
+	// LostHours are, per partition hour, the pieces at or below Floor of
+	// files that vanished before any node pulled them (#1207 S4b1c2): their
+	// rows in that hour are in no file, so they are not settled there, while
+	// the batches' rows in other hours, and other rows of the hour, still are.
+	// A piece leaves once Hours covers it again (republished).
+	LostHours map[int64]*hourIndex `json:"lh,omitempty"`
 }
 
 type hourIndex struct {
@@ -162,7 +187,102 @@ func (k *keyIndex) entries() int {
 	for _, h := range k.Hours {
 		n += len(h.Whole) + len(h.Partial)
 	}
+	for _, h := range k.LostHours {
+		n += len(h.Whole) + len(h.Partial)
+	}
 	return n
+}
+
+// floorSettled reports whether batch c is settled by the floor: at or below
+// it and not lost. Per hour, lostPieces may still take rows of it back.
+func (k *keyIndex) floorSettled(c uint64) bool { return c <= k.Floor && !k.Lost.contains(c) }
+
+// lostPieces returns the pieces of batch c whose rows in hour vanished; whole
+// when the whole batch did.
+func (k *keyIndex) lostPieces(c uint64, hour int64) (whole bool, ps []CoveragePiece) {
+	lh := k.LostHours[hour]
+	if lh == nil {
+		return false, nil
+	}
+	if lh.Whole.contains(c) {
+		return true, nil
+	}
+	for _, q := range lh.Partial {
+		if q.CSeq == c {
+			ps = append(ps, q)
+		}
+	}
+	return false, ps
+}
+
+// lostBatches returns the batches with a vanished piece in hour.
+func (k *keyIndex) lostBatches(hour int64) Intervals {
+	lh := k.LostHours[hour]
+	if lh == nil {
+		return nil
+	}
+	out := append(Intervals(nil), lh.Whole...)
+	for _, q := range lh.Partial {
+		out = out.addRange(q.CSeq, q.CSeq)
+	}
+	return out
+}
+
+// floorSettledSet is the batches settled by the floor in every hour: at or
+// below it, not lost, with no vanished piece in any hour. What a claim never
+// takes.
+func (k *keyIndex) floorSettledSet() Intervals {
+	if k == nil || k.Floor == 0 {
+		return nil
+	}
+	s := Intervals{{0, k.Floor}}.minus(k.Lost)
+	for h := range k.LostHours {
+		s = s.minus(k.lostBatches(h))
+	}
+	return s
+}
+
+// pruneLost drops the vanished pieces of hour that Hours covers again.
+func (k *keyIndex) pruneLost(hour int64) {
+	lh, h := k.LostHours[hour], k.Hours[hour]
+	if lh == nil || h == nil {
+		return
+	}
+	lh.Whole = lh.Whole.minus(h.Whole)
+	// A whole vanished batch republished in row or chunk pieces: only batches
+	// with pieces in this hour can be.
+	for _, q := range h.Partial {
+		if lh.Whole.contains(q.CSeq) && piecesCover(h.samePieces(q.CSeq), CoveragePiece{CSeq: q.CSeq}) {
+			lh.Whole = lh.Whole.removeRange(q.CSeq, q.CSeq)
+		}
+	}
+	kept := lh.Partial[:0]
+	for _, q := range lh.Partial {
+		// Re-covered whole, or every row of the batch in pieces (in any row
+		// coordinates), or the vanished rows themselves in the same ones.
+		same := h.samePieces(q.CSeq)
+		if h.Whole.contains(q.CSeq) || piecesCover(same, CoveragePiece{CSeq: q.CSeq}) || piecesCover(same, q) {
+			continue
+		}
+		kept = append(kept, q)
+	}
+	lh.Partial = kept
+	if len(lh.Whole) == 0 && len(lh.Partial) == 0 {
+		delete(k.LostHours, hour)
+	}
+}
+
+func (h *hourIndex) samePieces(c uint64) []CoveragePiece {
+	if h == nil {
+		return nil
+	}
+	var out []CoveragePiece
+	for _, q := range h.Partial {
+		if q.CSeq == c {
+			out = append(out, q)
+		}
+	}
+	return out
 }
 
 // settledWhole returns the batches of [lo, hi] whose rows in hour are, at
@@ -173,7 +293,12 @@ func (k *keyIndex) settledWhole(lo, hi uint64, hour int64) Intervals {
 	}
 	var out Intervals
 	if k.Floor >= lo {
+		// A batch whose rows of this hour all vanished is not settled here;
+		// one with only some rows vanished still has rows in a file.
 		out = Intervals{{lo, minU64(hi, k.Floor)}}.minus(k.Lost)
+		if lh := k.LostHours[hour]; lh != nil {
+			out = out.minus(lh.Whole)
+		}
 	}
 	if h := k.Hours[hour]; h != nil {
 		out = out.union(h.Whole.clip(lo, hi))
@@ -192,8 +317,10 @@ func (k *keyIndex) settledPiece(p CoveragePiece, hour int64) bool {
 	if k == nil {
 		return false
 	}
-	if p.CSeq <= k.Floor && !k.Lost.contains(p.CSeq) {
-		return true
+	if k.floorSettled(p.CSeq) {
+		if whole, lost := k.lostPieces(p.CSeq, hour); !whole && !piecesCover(lost, p) {
+			return true // some rows of p are in a file
+		}
 	}
 	h := k.Hours[hour]
 	if h == nil {
@@ -224,6 +351,37 @@ type StreamClaim struct {
 	// ExtendedAt is the log index of the last ExtendStreamClaim: a claimant
 	// computes what to replay only from a manifest at or past it.
 	ExtendedAt uint64 `json:"extended_at,omitempty"`
+	// FinishedBy are the writers whose earlier claims of this instance
+	// finished: each claims an instance at most once (a follow-up claim by
+	// another writer publishes what that one's copy lacked).
+	FinishedBy []string `json:"finished_by,omitempty"`
+	// Abandoned: an operator finished the claim, unpublished batches and
+	// all (they are in Unreplayable).
+	Abandoned bool `json:"abandoned,omitempty"`
+	// EndedAt is when the claim finished or was released (the proposer's
+	// clock): other writers follow up within a few passes of it.
+	EndedAt time.Time `json:"ended_at,omitempty"`
+	// VanishedAt is the log index of the last vanished file that took
+	// registered batches of this instance back while the claim was
+	// unfinished: the claimant publishes again what it had found
+	// registered.
+	VanishedAt uint64 `json:"vanished_at,omitempty"`
+}
+
+// finished reports whether node already finished a claim of this instance.
+func (c *StreamClaim) finished(node string) bool {
+	if c == nil {
+		return false
+	}
+	if c.Done && c.By == node {
+		return true
+	}
+	for _, f := range c.FinishedBy {
+		if f == node {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *StreamClaim) active() bool { return c != nil && !c.Released }
@@ -234,16 +392,43 @@ type takeoverState struct {
 	current   map[string]uint64
 	index     map[uint64]map[string]*keyIndex
 	claims    map[uint64]*StreamClaim
-	entries   int    // index entries across every instance (bounded by maxIndexEntries)
-	gen       uint64 // bumped on every change; not replicated (a reader's cache key)
+	// departed are writers that left gracefully (a restart, usually): their
+	// instances and claims are kept until they re-join, or until the leader
+	// expires the departure (RemoveReasonDepartedExpired). Keyed by node id,
+	// valued by the departure time the leave carried.
+	departed map[string]time.Time
+	// removed are the last instances removed (bounded, oldest first): a
+	// file naming one is refused as stale, so a writer returning with copies
+	// of an instance the cluster already accounted for cannot register them
+	// unchecked.
+	removed    []uint64
+	removedSet map[uint64]bool
+	entries    int    // index entries across every instance (bounded by maxIndexEntries)
+	gen        uint64 // bumped on every change; not replicated (a reader's cache key)
+
+	// vanished are the last files deleted as vanished (bounded, oldest
+	// first): a node that still has a local copy of one (it was down, or
+	// its origin came back with its volume) must take it out of its query
+	// path, since the rows were published again from another copy.
+	vanished []VanishedFile
+
+	// records are the live DELETE records, by ID (delete_records.go).
+	records []*DeleteRecord
+	// untrackedFloors are the settled floors of untracked instances, which
+	// have no index: a DELETE record is collected by them (delete_records.go).
+	untrackedFloors map[uint64]map[string]KeySettlement
 }
 
 func newTakeoverState() *takeoverState {
 	return &takeoverState{
-		instances: map[uint64]*StreamInstance{},
-		current:   map[string]uint64{},
-		index:     map[uint64]map[string]*keyIndex{},
-		claims:    map[uint64]*StreamClaim{},
+		instances:  map[uint64]*StreamInstance{},
+		current:    map[string]uint64{},
+		index:      map[uint64]map[string]*keyIndex{},
+		claims:     map[uint64]*StreamClaim{},
+		departed:   map[string]time.Time{},
+		removedSet: map[uint64]bool{},
+
+		untrackedFloors: map[uint64]map[string]KeySettlement{},
 	}
 }
 
@@ -252,12 +437,91 @@ type takeoverSnapshot struct {
 	Instances []StreamInstance                `json:"instances,omitempty"`
 	Index     map[string]map[string]*keyIndex `json:"index,omitempty"` // instance (hex) -> key
 	Claims    []StreamClaim                   `json:"claims,omitempty"`
+	Departed  map[string]time.Time            `json:"departed,omitempty"`
+	Removed   []uint64                        `json:"removed,omitempty"`
+	Vanished  []VanishedFile                  `json:"vanished,omitempty"`
+	Records   []DeleteRecord                  `json:"delete_records,omitempty"`
+	// UntrackedFloors: instance (hex) -> key -> floor.
+	UntrackedFloors map[string]map[string]KeySettlement `json:"untracked_floors,omitempty"`
+}
+
+// VanishedFile is a file deleted from the manifest as vanished.
+type VanishedFile struct {
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"size"`
+	SHA256    string `json:"sha,omitempty"`
+}
+
+// takeoverNoteVanishedLocked records a vanished file. Caller holds f.mu.
+func (f *ClusterFSM) takeoverNoteVanishedLocked(e FileEntry) {
+	t := f.takeover
+	if len(t.vanished) >= maxVanishedPaths {
+		t.vanished = t.vanished[1:]
+	}
+	t.vanished = append(t.vanished, VanishedFile{Path: e.Path, SizeBytes: e.SizeBytes, SHA256: e.SHA256})
+	t.gen++
+}
+
+// ClaimedFromOrigin reports whether the claimed rule would refuse an
+// origin's file (no claim epoch) holding batch cseq of (inst, key): an
+// active claim holds it, unfinished, or finished on an untracked instance
+// (as takeoverRefusalLocked).
+func (f *ClusterFSM) ClaimedFromOrigin(inst uint64, key string, cseq uint64) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	t := f.takeover
+	k := t.claims[inst]
+	if !f.streamClaims || !k.active() || (k.Done && trackedLocked(t, inst)) {
+		return false
+	}
+	return k.Set[key].contains(cseq)
+}
+
+// HotFilesOfInstance returns the hot files whose own coverage names inst
+// (not inherited from a file a DELETE rewrote), ordered by path.
+func (f *ClusterFSM) HotFilesOfInstance(inst uint64) []FileEntry {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	var out []FileEntry
+	for _, e := range f.files {
+		if (e.Tier != "" && e.Tier != "hot") || e.CoverageInherited {
+			continue
+		}
+		for _, c := range e.Coverage {
+			if c.Instance == inst {
+				out = append(out, *e)
+				break
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// InstanceKeys returns the buffer keys with registered batches of inst in
+// the index, sorted.
+func (f *ClusterFSM) InstanceKeys(inst uint64) []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make([]string, 0, len(f.takeover.index[inst]))
+	for k := range f.takeover.index[inst] {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// VanishedFiles returns the files last deleted as vanished, oldest first.
+func (f *ClusterFSM) VanishedFiles() []VanishedFile {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return append([]VanishedFile(nil), f.takeover.vanished...)
 }
 
 func instKey(i uint64) string { return fmt.Sprintf("%016x", i) }
 
 func (t *takeoverState) snapshot() *takeoverSnapshot {
-	if len(t.instances) == 0 && len(t.claims) == 0 {
+	if len(t.instances) == 0 && len(t.claims) == 0 && len(t.departed) == 0 && len(t.removed) == 0 && len(t.vanished) == 0 && len(t.records) == 0 && len(t.untrackedFloors) == 0 {
 		return nil
 	}
 	s := &takeoverSnapshot{Index: map[string]map[string]*keyIndex{}}
@@ -278,6 +542,27 @@ func (t *takeoverState) snapshot() *takeoverSnapshot {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	for _, id := range ids {
 		s.Claims = append(s.Claims, t.claims[id].clone())
+	}
+	if len(t.departed) > 0 {
+		s.Departed = make(map[string]time.Time, len(t.departed))
+		for id, at := range t.departed {
+			s.Departed[id] = at
+		}
+	}
+	s.Removed = append([]uint64(nil), t.removed...)
+	s.Vanished = append([]VanishedFile(nil), t.vanished...)
+	for _, r := range t.records {
+		s.Records = append(s.Records, r.clone())
+	}
+	if len(t.untrackedFloors) > 0 {
+		s.UntrackedFloors = map[string]map[string]KeySettlement{}
+		for id, keys := range t.untrackedFloors {
+			cp := make(map[string]KeySettlement, len(keys))
+			for k, v := range keys {
+				cp[k] = KeySettlement{Floor: v.Floor, Lost: append(Intervals(nil), v.Lost...)}
+			}
+			s.UntrackedFloors[instKey(id)] = cp
+		}
 	}
 	return s
 }
@@ -311,6 +596,30 @@ func restoreTakeover(s *takeoverSnapshot) *takeoverState {
 		c := s.Claims[i]
 		t.claims[c.Instance] = &c
 	}
+	for id, at := range s.Departed {
+		t.departed[id] = at
+	}
+	for _, id := range s.Removed {
+		if !t.removedSet[id] {
+			t.removed = append(t.removed, id)
+			t.removedSet[id] = true
+		}
+	}
+	t.vanished = append([]VanishedFile(nil), s.Vanished...)
+	if len(t.vanished) > maxVanishedPaths {
+		t.vanished = t.vanished[len(t.vanished)-maxVanishedPaths:]
+	}
+	for i := range s.Records {
+		r := s.Records[i].clone()
+		t.records = append(t.records, &r)
+	}
+	sort.SliceStable(t.records, func(i, j int) bool { return t.records[i].ID < t.records[j].ID })
+	for hex, keys := range s.UntrackedFloors {
+		var id uint64
+		if _, err := fmt.Sscanf(hex, "%016x", &id); err == nil {
+			t.untrackedFloors[id] = keys
+		}
+	}
 	return t
 }
 
@@ -319,6 +628,12 @@ func (k *keyIndex) clone() *keyIndex {
 	for h, v := range k.Hours {
 		c.Hours[h] = &hourIndex{Whole: append(Intervals(nil), v.Whole...), Partial: append([]CoveragePiece(nil), v.Partial...)}
 	}
+	if len(k.LostHours) > 0 {
+		c.LostHours = make(map[int64]*hourIndex, len(k.LostHours))
+		for h, v := range k.LostHours {
+			c.LostHours[h] = &hourIndex{Whole: append(Intervals(nil), v.Whole...), Partial: append([]CoveragePiece(nil), v.Partial...)}
+		}
+	}
 	return c
 }
 
@@ -326,6 +641,7 @@ func (c *StreamClaim) clone() StreamClaim {
 	cc := *c
 	cc.Set = cloneIntervalMap(c.Set)
 	cc.Unreplayable = cloneIntervalMap(c.Unreplayable)
+	cc.FinishedBy = append([]string(nil), c.FinishedBy...)
 	return cc
 }
 
@@ -493,8 +809,13 @@ func (f *ClusterFSM) takeoverRefusalLocked(p RegisterFilePayload, scratch, repla
 	hour := fileHour(p.File)
 	for _, c := range p.Cov2 {
 		// Claims first: they do not depend on the index, so neither a
-		// truncated coverage nor an untracked instance gets past them.
-		if k := t.claims[c.Instance]; k.active() && c.ClaimEpoch != k.Epoch {
+		// truncated coverage nor an untracked instance gets past them. A
+		// finished claim no longer refuses the origin's own copies of a
+		// tracked instance: what the claimant published is in the index (the
+		// duplicate rule refuses it), and what it could not publish, or what
+		// vanished since, is the origin's to publish.
+		if k := t.claims[c.Instance]; k.active() && c.ClaimEpoch != k.Epoch &&
+			!(k.Done && c.ClaimEpoch == 0 && !c.Truncated && trackedLocked(t, c.Instance)) {
 			if c.Truncated || overlapsSet(c, k.Set[c.Key]) {
 				return RefusedOp{Kind: RefusedClaimed, Instance: c.Instance, Epoch: k.Epoch}, true
 			}
@@ -508,7 +829,18 @@ func (f *ClusterFSM) takeoverRefusalLocked(p RegisterFilePayload, scratch, repla
 				return RefusedOp{Kind: RefusedStale, Instance: c.Instance, Epoch: c.ClaimEpoch}, true
 			}
 		}
+		// DELETE records next: a file holding batches acknowledged before a
+		// DELETE must carry its rows minus the deleted ones.
+		if r, ok := f.deletedRefusalLocked(c, p.DeleteSeen); ok {
+			return r, true
+		}
 		in := t.instances[c.Instance]
+		if in == nil && t.removedSet[c.Instance] {
+			// Accounted for and removed: its batches were published or
+			// settled. A late copy (a writer back with an old volume) is not
+			// registered unchecked.
+			return RefusedOp{Kind: RefusedStale, Instance: c.Instance}, true
+		}
 		if in == nil || in.Untracked || c.Truncated {
 			continue
 		}
@@ -520,6 +852,12 @@ func (f *ClusterFSM) takeoverRefusalLocked(p RegisterFilePayload, scratch, repla
 		}
 	}
 	return RefusedOp{}, false
+}
+
+// trackedLocked: the instance is known and indexed.
+func trackedLocked(t *takeoverState, inst uint64) bool {
+	in := t.instances[inst]
+	return in != nil && !in.Untracked
 }
 
 // duplicateLocked reports whether some batch of c already has rows of this
@@ -551,7 +889,7 @@ func (f *ClusterFSM) duplicateLocked(c InstanceCoverage, hour int64, scratch, re
 // its coverage, and the index gains its batches for the file's hour. old is
 // the entry the path had before, if any. Caller holds f.mu.
 func (f *ClusterFSM) takeoverRegisteredLocked(p RegisterFilePayload, entry *FileEntry, inherited []InstanceCoverage) {
-	entry.Coverage = nil
+	entry.Coverage, entry.CoverageInherited = nil, false
 	if !f.streamClaims {
 		return
 	}
@@ -559,13 +897,14 @@ func (f *ClusterFSM) takeoverRegisteredLocked(p RegisterFilePayload, entry *File
 		// A DELETE rewrite: the same rows minus the deleted ones, so the
 		// coverage moves with them and the index is unchanged.
 		entry.Coverage = inherited
+		entry.CoverageInherited = len(inherited) > 0
 		return
 	}
 	if len(p.Cov2) == 0 {
 		// A re-registration of the same path without coverage (a restore)
 		// keeps what the FSM knew of it.
 		if old, ok := f.files[entry.Path]; ok {
-			entry.Coverage = old.Coverage
+			entry.Coverage, entry.CoverageInherited = old.Coverage, old.CoverageInherited
 		}
 		return
 	}
@@ -610,19 +949,26 @@ func (f *ClusterFSM) indexAddLocked(c InstanceCoverage, hour int64) {
 		ki.Hours[hour] = h
 	}
 	var add Intervals
+	lost := ki.lostBatches(hour)
 	for _, r := range normalized(c.Ranges) {
 		if r[1] <= ki.Floor && !ki.Lost.overlaps(r[0], r[1]) {
+			// Settled by the floor, except batches with a vanished piece here.
+			add = append(add, lost.clip(r[0], r[1])...)
 			continue
 		}
 		add = append(add, r)
 	}
-	h.Whole = h.Whole.union(add)
+	h.Whole = h.Whole.union(normalized(add))
 	for _, p := range c.Partial {
-		if p.CSeq <= ki.Floor && !ki.Lost.contains(p.CSeq) {
+		if ki.floorSettled(p.CSeq) && !lost.contains(p.CSeq) {
 			continue
 		}
 		h.Partial = append(h.Partial, p)
 	}
+	if len(h.Whole) == 0 && len(h.Partial) == 0 {
+		delete(ki.Hours, hour)
+	}
+	ki.pruneLost(hour)
 	t.entries += ki.entries() - before
 	whole, partial := 0, 0
 	for _, hh := range ki.Hours {
@@ -633,9 +979,46 @@ func (f *ClusterFSM) indexAddLocked(c InstanceCoverage, hour int64) {
 		f.untrackLocked(in, "the settled index of a buffer key is over its bound")
 		return
 	}
-	if t.entries > maxIndexEntries {
+	if t.entries > maxIndexEntries && !f.evictRetiredForRoomLocked(in.Instance) {
 		f.untrackLocked(in, "the settled index is over its cluster-wide bound")
 	}
+}
+
+// evictRetiredForRoomLocked removes retired instances, oldest first, until
+// the index is within its cluster-wide bound: a retired index only matters
+// if its writer comes back, a live one on every failover. It reports
+// whether the index fits. Caller holds f.mu.
+func (f *ClusterFSM) evictRetiredForRoomLocked(keep uint64) bool {
+	t := f.takeover
+	for t.entries > maxIndexEntries {
+		var oldest *StreamInstance
+		for _, id := range sortedInstanceIDs(t.instances) {
+			if r := t.instances[id]; r.Status == InstanceRetired && id != keep && (oldest == nil || r.RetiredAt < oldest.RetiredAt) {
+				oldest = r
+			}
+		}
+		if oldest == nil {
+			return false
+		}
+		f.logger.Warn().Str("instance", instKey(oldest.Instance)).Str("origin", oldest.Origin).
+			Msg("Settled index full; the oldest retired writer instance is removed to make room, and copies of it that come back are parked")
+		f.removeInstanceLocked(oldest.Instance)
+	}
+	return true
+}
+
+// retiredEntriesLocked counts the index entries of retired instances other
+// than except: room a registration may take (evictRetiredForRoomLocked).
+func (f *ClusterFSM) retiredEntriesLocked(except uint64) int {
+	n := 0
+	for id, in := range f.takeover.instances {
+		if in.Status == InstanceRetired && id != except {
+			for _, k := range f.takeover.index[id] {
+				n += k.entries()
+			}
+		}
+	}
+	return n
 }
 
 // indexWouldOverflowLocked reports whether indexing c at hour, after what
@@ -659,20 +1042,22 @@ func (f *ClusterFSM) indexWouldOverflowLocked(c InstanceCoverage, hour int64, sc
 		}
 		ki = &keyIndex{}
 	}
+	lost := ki.lostBatches(hour)
 	above := func(rs [][2]uint64) Intervals {
 		var out Intervals
 		for _, r := range normalized(rs) {
 			if r[1] <= ki.Floor && !ki.Lost.overlaps(r[0], r[1]) {
+				out = append(out, lost.clip(r[0], r[1])...)
 				continue
 			}
 			out = append(out, r)
 		}
-		return out
+		return normalized(out)
 	}
 	partialsAbove := func(ps []CoveragePiece) int {
 		n := 0
 		for _, p := range ps {
-			if p.CSeq > ki.Floor || ki.Lost.contains(p.CSeq) {
+			if !ki.floorSettled(p.CSeq) || lost.contains(p.CSeq) {
 				n++
 			}
 		}
@@ -717,24 +1102,176 @@ func (f *ClusterFSM) indexWouldOverflowLocked(c InstanceCoverage, hour int64, sc
 			}
 		}
 	}
-	return t.entries+pending+whole+partial-before > maxIndexEntries
+	return t.entries+pending+whole+partial-before-f.retiredEntriesLocked(c.Instance) > maxIndexEntries
+}
+
+// takeoverVanishedLocked takes back the batches of a file that vanished
+// before any node pulled it: above the floor from the hour's index, at or
+// below it as vanished pieces of that hour. An unfinished claim on the
+// instance grows to take them, so the claimant republishes them and the
+// origin's copies are refused. Caller holds f.mu.
+func (f *ClusterFSM) takeoverVanishedLocked(c InstanceCoverage, hour int64, logIndex uint64) {
+	t := f.takeover
+	if f.indexSubtractLocked(c, hour) {
+		if k := t.claims[c.Instance]; k.active() && !k.Done {
+			k.VanishedAt = logIndex
+		}
+	}
+	in := t.instances[c.Instance]
+	ki := t.index[c.Instance][c.Key]
+	if in == nil || in.Untracked || ki == nil || c.Truncated {
+		return
+	}
+	var whole Intervals
+	for _, r := range normalized(c.Ranges) {
+		if r[0] > ki.Floor {
+			continue
+		}
+		whole = whole.union(Intervals{{r[0], minU64(r[1], ki.Floor)}}.minus(ki.Lost))
+	}
+	var partial []CoveragePiece
+	for _, p := range c.Partial {
+		if ki.floorSettled(p.CSeq) {
+			partial = append(partial, p)
+		}
+	}
+	if len(whole) == 0 && len(partial) == 0 {
+		return
+	}
+	before := ki.entries()
+	if ki.LostHours == nil {
+		ki.LostHours = map[int64]*hourIndex{}
+	}
+	lh := ki.LostHours[hour]
+	if lh == nil {
+		lh = &hourIndex{}
+		ki.LostHours[hour] = lh
+	}
+	lh.Whole = lh.Whole.union(whole)
+	lh.Partial = append(lh.Partial, partial...)
+	t.entries += ki.entries() - before
+	t.gen++
+	n := 0
+	for _, h := range ki.LostHours {
+		n += len(h.Whole) + len(h.Partial)
+	}
+	if n > maxKeyLost || (t.entries > maxIndexEntries && !f.evictRetiredForRoomLocked(in.Instance)) {
+		f.untrackLocked(in, "the vanished pieces of a buffer key are over their bound")
+		return
+	}
+	if k := t.claims[c.Instance]; k.active() && !k.Done {
+		set := k.Set[c.Key].union(whole)
+		for _, p := range partial {
+			set = set.addRange(p.CSeq, p.CSeq)
+		}
+		if len(set) > maxClaimIntervalsPerKey {
+			f.untrackLocked(in, "a claim grew past its bound with vanished batches")
+			return
+		}
+		k.Set[c.Key] = set
+		k.ExtendedAt = logIndex
+	}
+}
+
+// ClaimableSet returns the batches of ivs a claim of (inst, key) would take:
+// all but those settled by the floor in every hour.
+func (f *ClusterFSM) ClaimableSet(inst uint64, key string, ivs Intervals) Intervals {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	s := normalized(ivs)
+	if ki := f.takeover.index[inst][key]; ki != nil {
+		s = s.minus(ki.floorSettledSet())
+	}
+	return s
+}
+
+// KeyFloor returns the floor of (inst, key): every batch at or below it is
+// in a registered file in every hour, except the lost ones (0: none).
+func (f *ClusterFSM) KeyFloor(inst uint64, key string) uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if ki := f.takeover.index[inst][key]; ki != nil {
+		return ki.Floor
+	}
+	return 0
+}
+
+// Tombstoned reports whether inst was accounted for and removed (one of the
+// last maxTakeoverTombstones).
+func (f *ClusterFSM) Tombstoned(inst uint64) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.takeover.removedSet[inst]
+}
+
+// FollowUp is an instance whose claim ended (finished or released) and that
+// other writers may still claim batches of.
+type FollowUp struct {
+	Instance uint64
+	Origin   string
+	Keys     []string  // the ended claim's keys
+	Answered []string  // writers that finished a claim of it or reported holding nothing
+	EndedAt  time.Time // when the claim ended
+}
+
+// FollowUps returns the instances with an ended claim that a follow-up claim
+// may still come for.
+func (f *ClusterFSM) FollowUps() []FollowUp {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	var out []FollowUp
+	for _, id := range sortedInstanceIDs(f.takeover.instances) {
+		in := f.takeover.instances[id]
+		c := f.takeover.claims[id]
+		if c == nil || in.Untracked || (!c.Done && !c.Released) || !f.followUpOpenLocked(in) {
+			continue
+		}
+		fu := FollowUp{Instance: id, Origin: in.Origin, EndedAt: c.EndedAt}
+		for k := range c.Set {
+			fu.Keys = append(fu.Keys, k)
+		}
+		for k := range c.Unreplayable {
+			if _, dup := c.Set[k]; !dup {
+				fu.Keys = append(fu.Keys, k)
+			}
+		}
+		sort.Strings(fu.Keys)
+		fu.Answered = append(fu.Answered, c.FinishedBy...)
+		if c.Done {
+			fu.Answered = append(fu.Answered, c.By)
+		}
+		fu.Answered = append(fu.Answered, in.ReportedBy...)
+		out = append(out, fu)
+	}
+	return out
+}
+
+// FinishedClaimOf reports whether node finished a claim of inst (it does
+// not claim it again).
+func (f *ClusterFSM) FinishedClaimOf(inst uint64, node string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.takeover.claims[inst].finished(node)
 }
 
 // indexSubtractLocked removes c's batches for hour: a file that vanished
-// before any node could pull it holds nothing.
-func (f *ClusterFSM) indexSubtractLocked(c InstanceCoverage, hour int64) {
+// before any node could pull it holds nothing. It reports whether anything
+// was removed.
+func (f *ClusterFSM) indexSubtractLocked(c InstanceCoverage, hour int64) bool {
 	t := f.takeover
 	t.gen++
 	ki := t.index[c.Instance][c.Key]
 	if ki == nil {
-		return
+		return false
 	}
 	h := ki.Hours[hour]
 	if h == nil {
-		return
+		return false
 	}
 	before := ki.entries()
+	changed := false
 	for _, r := range c.Ranges {
+		changed = changed || h.Whole.overlaps(r[0], r[1])
 		h.Whole = h.Whole.removeRange(r[0], r[1])
 	}
 	if len(c.Partial) > 0 {
@@ -750,6 +1287,7 @@ func (f *ClusterFSM) indexSubtractLocked(c InstanceCoverage, hour int64) {
 			if !drop {
 				kept = append(kept, q)
 			}
+			changed = changed || drop
 		}
 		h.Partial = kept
 	}
@@ -757,6 +1295,7 @@ func (f *ClusterFSM) indexSubtractLocked(c InstanceCoverage, hour int64) {
 		delete(ki.Hours, hour)
 	}
 	t.entries += ki.entries() - before
+	return changed
 }
 
 // untrackLocked stops indexing an instance and frees its index. Its
@@ -767,6 +1306,16 @@ func (f *ClusterFSM) untrackLocked(in *StreamInstance, why string) {
 		return
 	}
 	in.Untracked = true
+	// Its floors keep counting for the DELETE records naming it.
+	keys := map[string]KeySettlement{}
+	for k, ki := range f.takeover.index[in.Instance] {
+		if ki.Floor > 0 {
+			keys[k] = KeySettlement{Floor: ki.Floor, Lost: append(Intervals(nil), ki.Lost...)}
+		}
+	}
+	if len(keys) > 0 {
+		f.takeover.untrackedFloors[in.Instance] = keys
+	}
 	f.dropIndexLocked(in.Instance)
 	f.logger.Error().Str("instance", instKey(in.Instance)).Str("origin", in.Origin).Str("reason", why).
 		Msg("Stream takeover stopped tracking a writer instance; a failover from it cannot take over its unflushed batches")
@@ -783,12 +1332,22 @@ func (f *ClusterFSM) dropIndexLocked(inst uint64) {
 func (f *ClusterFSM) removeInstanceLocked(inst uint64) {
 	t := f.takeover
 	t.gen++
+	if _, known := t.instances[inst]; known && !t.removedSet[inst] {
+		if len(t.removed) >= maxTakeoverTombstones {
+			delete(t.removedSet, t.removed[0])
+			t.removed = t.removed[1:]
+		}
+		t.removed = append(t.removed, inst)
+		t.removedSet[inst] = true
+	}
 	f.dropIndexLocked(inst)
 	if in := t.instances[inst]; in != nil && t.current[in.Origin] == inst {
 		delete(t.current, in.Origin)
 	}
 	delete(t.instances, inst)
 	delete(t.claims, inst)
+	delete(t.untrackedFloors, inst)
+	f.gcDeleteRecordsLocked()
 }
 
 // ---- commands ----
@@ -844,9 +1403,10 @@ func (f *ClusterFSM) applyAnnounceInstance(payload []byte, logIndex uint64) inte
 	}
 	prev, hadPrev := t.current[p.Origin]
 	continuity := hadPrev && p.Continuity.WAL == prev && p.Continuity.Journal == prev && p.Continuity.Storage == prev
+	var ended []uint64
 	for _, id := range sortedInstanceIDs(t.instances) {
 		in := t.instances[id]
-		if in.Origin != p.Origin {
+		if in == nil || in.Origin != p.Origin {
 			continue
 		}
 		in.OriginGone = false
@@ -864,6 +1424,15 @@ func (f *ClusterFSM) applyAnnounceInstance(payload []byte, logIndex uint64) inte
 				in.Status = InstanceOrphaned
 			}
 			in.AdoptedBy = 0
+			// Published by its claimant, and its origin holds nothing of it:
+			// removed once every writer finished or reported (as on
+			// ClaimDone). After the loop: retiring one may remove another.
+			ended = append(ended, id)
+		}
+	}
+	for _, id := range ended {
+		if in := t.instances[id]; in != nil {
+			f.removeIfAllReportedLocked(in)
 		}
 	}
 	delete(t.current, p.Origin)
@@ -916,6 +1485,7 @@ func (f *ClusterFSM) applySettleCoverage(payload []byte) interface{} {
 		return fmt.Errorf("settle coverage: %s is not the current instance of %s", instKey(p.Instance), p.Origin)
 	}
 	if in.Untracked {
+		f.untrackedSettleLocked(p)
 		return nil
 	}
 	keys := make([]string, 0, len(p.Keys))
@@ -962,19 +1532,21 @@ func (f *ClusterFSM) applySettleCoverage(payload []byte) interface{} {
 		ki.Floor = s.Floor
 		for hr, h := range ki.Hours {
 			var whole Intervals
+			lostHere := ki.lostBatches(hr)
 			for _, iv := range h.Whole {
 				if iv[1] > ki.Floor {
 					whole = whole.addRange(maxU64(iv[0], ki.Floor+1), iv[1])
 				}
-				// At or below the floor: kept only where lost.
-				for _, l := range ki.Lost.clip(iv[0], minU64(iv[1], ki.Floor)) {
+				// At or below the floor: kept only where lost (in every hour,
+				// or a vanished piece of this one).
+				for _, l := range ki.Lost.union(lostHere).clip(iv[0], minU64(iv[1], ki.Floor)) {
 					whole = whole.addRange(l[0], l[1])
 				}
 			}
 			h.Whole = whole
 			kept := h.Partial[:0]
 			for _, q := range h.Partial {
-				if q.CSeq > ki.Floor || ki.Lost.contains(q.CSeq) {
+				if q.CSeq > ki.Floor || ki.Lost.contains(q.CSeq) || lostHere.contains(q.CSeq) {
 					kept = append(kept, q)
 				}
 			}
@@ -984,11 +1556,12 @@ func (f *ClusterFSM) applySettleCoverage(payload []byte) interface{} {
 			}
 		}
 		t.entries += ki.entries() - before
-		if len(ki.Lost) > maxKeyLost || t.entries > maxIndexEntries {
+		if len(ki.Lost) > maxKeyLost || (t.entries > maxIndexEntries && !f.evictRetiredForRoomLocked(in.Instance)) {
 			f.untrackLocked(in, "the settled index is over its bound")
 			return nil
 		}
 	}
+	f.gcDeleteRecordsLocked()
 	return nil
 }
 
@@ -1041,26 +1614,31 @@ func (f *ClusterFSM) applyTakeOverStreamV2(payload []byte, logIndex uint64) inte
 	newClaims := 0
 	for _, c := range p.Claims {
 		in := t.instances[c.Instance]
+		prev := t.claims[c.Instance]
 		switch {
 		case in == nil || in.Origin != p.Origin:
 			return fmt.Errorf("take over stream: %s is not a known instance of %s", instKey(c.Instance), p.Origin)
 		case in.Untracked:
 			return fmt.Errorf("take over stream: %s is not tracked", instKey(c.Instance))
-		case t.claims[c.Instance].active():
+		case in.Status == InstanceRetired:
+			return fmt.Errorf("take over stream: %s is retired", instKey(c.Instance))
+		case prev.active() && !prev.Done:
 			return fmt.Errorf("take over stream: %s is already claimed", instKey(c.Instance))
+		case prev.finished(p.By):
+			return fmt.Errorf("take over stream: %s already finished a claim of %s", p.By, instKey(c.Instance))
 		case len(c.Keys) > maxInstanceKeys:
 			return fmt.Errorf("take over stream: %d keys for one instance", len(c.Keys))
 		}
-		switch in.Status {
-		case InstanceCurrent:
-			if f.primaryWriterID != p.By {
+		// A live instance is claimed by the designated primary: a claim
+		// follows a failover, so a standby that merely lost sight of a live
+		// primary cannot claim (and stop) it. Another writer may make a
+		// follow-up claim (publishing what its own copy holds) only while
+		// the origin is still taken over: see followUpOpenLocked.
+		if in.Status == InstanceCurrent || in.Status == InstanceAdopted {
+			if f.primaryWriterID != p.By && !f.followUpOpenLocked(in) {
 				return fmt.Errorf("take over stream: only the designated primary takes over %s", instKey(c.Instance))
 			}
-		case InstanceAdopted:
-			if f.primaryWriterID != p.By {
-				return fmt.Errorf("take over stream: only the designated primary takes over %s", instKey(c.Instance))
-			}
-			if !inCmd[in.AdoptedBy] && !t.claims[in.AdoptedBy].active() {
+			if in.Status == InstanceAdopted && !inCmd[in.AdoptedBy] && t.claims[in.AdoptedBy] == nil {
 				return fmt.Errorf("take over stream: %s is held by the live instance %s", instKey(c.Instance), instKey(in.AdoptedBy))
 			}
 		}
@@ -1069,7 +1647,7 @@ func (f *ClusterFSM) applyTakeOverStreamV2(payload []byte, logIndex uint64) inte
 				return errors.New("take over stream: a claimed key is malformed or over its bound")
 			}
 		}
-		if len(c.Keys) > 0 {
+		if len(c.Keys) > 0 && prev == nil {
 			newClaims++
 		}
 	}
@@ -1084,20 +1662,30 @@ func (f *ClusterFSM) applyTakeOverStreamV2(payload []byte, logIndex uint64) inte
 			// Batches settled in every hour (at or below the floor, not
 			// lost) are not claimable. Hours settled above the floor are
 			// filtered by the claimant when it replays.
-			if ki := t.index[c.Instance][k]; ki != nil && ki.Floor > 0 {
-				s = s.minus(Intervals{{0, ki.Floor}}.minus(ki.Lost))
+			if ki := t.index[c.Instance][k]; ki != nil {
+				s = s.minus(ki.floorSettledSet())
 			}
 			if len(s) > 0 {
 				set[k] = s
 			}
 		}
 		if len(set) == 0 {
-			if in != nil {
+			// Only an instance listed with no keys at all reports holding
+			// nothing; a set the floors trimmed to nothing claims nothing and
+			// reports nothing (later keys may still be claimed).
+			if in != nil && len(c.Keys) == 0 {
 				f.reportedEmptyLocked(in, p.By)
 			}
 			continue
 		}
-		t.claims[c.Instance] = &StreamClaim{Instance: c.Instance, Origin: p.Origin, By: p.By, Epoch: logIndex, Set: set, At: p.Now}
+		claim := &StreamClaim{Instance: c.Instance, Origin: p.Origin, By: p.By, Epoch: logIndex, Set: set, At: p.Now}
+		if prev := t.claims[c.Instance]; prev != nil {
+			claim.FinishedBy = append(claim.FinishedBy, prev.FinishedBy...)
+			if prev.Done && len(claim.FinishedBy) < maxTakeoverReportedWriters {
+				claim.FinishedBy = append(claim.FinishedBy, prev.By)
+			}
+		}
+		t.claims[c.Instance] = claim
 		f.logger.Info().Str("origin", p.Origin).Str("by", p.By).Str("instance", instKey(c.Instance)).
 			Uint64("epoch", logIndex).Int("keys", len(set)).
 			Msg("Stream claim applied: the claimant now owns the claimed batches of this instance")
@@ -1105,11 +1693,34 @@ func (f *ClusterFSM) applyTakeOverStreamV2(payload []byte, logIndex uint64) inte
 	return nil
 }
 
-// reportedEmptyLocked records that a writer holds nothing to claim of a
-// closed or orphaned instance; once every other writer has said so, nobody
-// can ever publish anything of it and it is removed.
+// followUpOpenLocked reports whether any writer (not only the designated
+// primary) may claim a live instance: it was claimed before (or its adopter
+// was), its origin is not the designated primary, and the origin is still
+// taken over: the instance is still its current one, or the process that
+// adopted it is claimed. A writer that restarted (a new current process
+// adopting it) publishes it itself.
+func (f *ClusterFSM) followUpOpenLocked(in *StreamInstance) bool {
+	t := f.takeover
+	switch {
+	case in.Status == InstanceRetired:
+		return false
+	case in.Status != InstanceCurrent && in.Status != InstanceAdopted:
+		return true
+	case f.primaryWriterID == in.Origin:
+		return false
+	case in.Status == InstanceCurrent:
+		return t.claims[in.Instance] != nil
+	}
+	return t.claims[in.AdoptedBy].active()
+}
+
+// reportedEmptyLocked records that a writer holds nothing to claim of an
+// instance a claim may follow up on (closed or orphaned, or a live one
+// claimed before); once every other writer of a closed or orphaned one has
+// said so (or finished a claim of it), nobody can ever publish anything of
+// it and it is removed.
 func (f *ClusterFSM) reportedEmptyLocked(in *StreamInstance, by string) {
-	if in.Status != InstanceClosed && in.Status != InstanceOrphaned {
+	if (in.Status == InstanceCurrent || in.Status == InstanceAdopted || in.Status == InstanceRetired) && !f.followUpOpenLocked(in) {
 		return
 	}
 	for _, r := range in.ReportedBy {
@@ -1126,28 +1737,78 @@ func (f *ClusterFSM) reportedEmptyLocked(in *StreamInstance, by string) {
 // removeIfAllReportedLocked removes a closed or orphaned instance once every
 // writer other than its origin has reported holding nothing of it.
 func (f *ClusterFSM) removeIfAllReportedLocked(in *StreamInstance) {
-	if len(in.ReportedBy) == 0 || (in.Status != InstanceClosed && in.Status != InstanceOrphaned) {
+	c := f.takeover.claims[in.Instance]
+	if (len(in.ReportedBy) == 0 && !(c.active() && c.Done)) || (in.Status != InstanceClosed && in.Status != InstanceOrphaned) {
 		return
 	}
-	if c := f.takeover.claims[in.Instance]; c.active() && !c.Done {
+	if c.active() && !c.Done {
 		return // another writer is still publishing it
+	}
+	// A writer that finished a claim of it published what it held.
+	reported := func(id string) bool {
+		if c.finished(id) {
+			return true
+		}
+		for _, r := range in.ReportedBy {
+			if r == id {
+				return true
+			}
+		}
+		return false
 	}
 	for id, n := range f.nodes {
 		if n.Role != "writer" || id == in.Origin {
 			continue
 		}
-		found := false
-		for _, r := range in.ReportedBy {
-			if r == id {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !reported(id) {
 			return
 		}
 	}
+	// A writer that left gracefully may hold the only copy: it must report
+	// too (it can once it re-joins; its departure expires otherwise).
+	for id := range f.takeover.departed {
+		if id == in.Origin {
+			continue
+		}
+		if !reported(id) {
+			return
+		}
+	}
+	if in.Status == InstanceOrphaned && !in.Untracked {
+		f.retireLocked(in)
+		return
+	}
 	f.removeInstanceLocked(in.Instance)
+}
+
+// retireLocked keeps an orphaned instance every writer finished with,
+// index and claim included, instead of removing it: its origin may still
+// come back with the volume the cluster wrote off, and only the index can
+// tell which of that volume's batches nobody registered. Past
+// maxRetiredInstances the oldest retired instance is removed (its late
+// copies are then refused as stale and stay parked). Caller holds f.mu.
+func (f *ClusterFSM) retireLocked(in *StreamInstance) {
+	t := f.takeover
+	t.gen++
+	in.Status, in.AdoptedBy, in.RetiredAt = InstanceRetired, 0, f.applyStarted.Load()
+	var retired []*StreamInstance
+	for _, id := range sortedInstanceIDs(t.instances) {
+		if r := t.instances[id]; r.Status == InstanceRetired {
+			retired = append(retired, r)
+		}
+	}
+	if len(retired) <= maxRetiredInstances {
+		return
+	}
+	oldest := retired[0]
+	for _, r := range retired[1:] {
+		if r.RetiredAt < oldest.RetiredAt {
+			oldest = r
+		}
+	}
+	f.logger.Warn().Str("instance", instKey(oldest.Instance)).Str("origin", oldest.Origin).
+		Msg("Too many retired writer instances; the oldest is removed, and copies of it that come back are parked")
+	f.removeInstanceLocked(oldest.Instance)
 }
 
 // ClaimDonePayload ends a claimant's replay. Unreplayable are claimed
@@ -1158,6 +1819,12 @@ type ClaimDonePayload struct {
 	By           string               `json:"by"`
 	Epoch        uint64               `json:"epoch"`
 	Unreplayable map[string]Intervals `json:"unreplayable,omitempty"`
+	// Abandon is an operator finishing a claim its claimant cannot (By
+	// empty, proposed on the leader): every batch still claimed becomes
+	// unreplayable, and the claimant stops.
+	Abandon bool `json:"abandon,omitempty"`
+	// Now is the proposer's clock (EndedAt).
+	Now time.Time `json:"now,omitempty"`
 }
 
 func (f *ClusterFSM) applyClaimDone(payload []byte) interface{} {
@@ -1172,13 +1839,24 @@ func (f *ClusterFSM) applyClaimDone(payload []byte) interface{} {
 	defer f.mu.Unlock()
 	t := f.takeover
 	c := t.claims[p.Instance]
-	if !f.streamClaims || !c.active() || c.By != p.By || c.Epoch != p.Epoch {
+	if p.Abandon {
+		if !f.streamClaims || !c.active() || p.By != "" || c.Epoch != p.Epoch {
+			return fmt.Errorf("claim done: no active claim %d of %s to abandon", p.Epoch, instKey(p.Instance))
+		}
+		if c.Done {
+			return fmt.Errorf("claim done: claim %d of %s is finished", p.Epoch, instKey(p.Instance))
+		}
+		p.Unreplayable = cloneIntervalMap(c.Set)
+		c.Abandoned = true
+		f.logger.Error().Str("instance", instKey(p.Instance)).Str("by", c.By).
+			Msg("Stream claim abandoned by an operator: its unpublished batches are left to their origin")
+	} else if !f.streamClaims || !c.active() || c.By != p.By || c.Epoch != p.Epoch {
 		return fmt.Errorf("claim done: no active claim %d of %s by %s", p.Epoch, instKey(p.Instance), p.By)
 	}
 	if c.Done {
 		return nil
 	}
-	c.Done = true
+	c.Done, c.EndedAt = true, p.Now
 	if len(p.Unreplayable) > 0 {
 		c.Unreplayable = map[string]Intervals{}
 		n := 0
@@ -1195,9 +1873,11 @@ func (f *ClusterFSM) applyClaimDone(payload []byte) interface{} {
 		f.logger.Error().Str("instance", instKey(p.Instance)).Str("by", p.By).Int("intervals", n).
 			Msg("Stream claim finished with batches the claimant could not publish; they are left to their origin")
 	}
-	if in := t.instances[p.Instance]; in != nil && (in.OriginGone || in.Status == InstanceClosed || in.Status == InstanceOrphaned) {
-		// Nothing will ever register this instance again.
-		f.removeInstanceLocked(p.Instance)
+	if in := t.instances[p.Instance]; in != nil {
+		// Its origin will never register it again: removed once every other
+		// writer finished a claim of it or reported holding nothing (another
+		// standby's copy may hold batches this claimant's lacked).
+		f.removeIfAllReportedLocked(in)
 	}
 	return nil
 }
@@ -1210,6 +1890,8 @@ type ReleaseStreamClaimPayload struct {
 	// By is set when the claimant releases its own claim (its store copy is
 	// gone); unset is an operator release proposed on the leader.
 	By string `json:"by,omitempty"`
+	// Now is the proposer's clock (EndedAt).
+	Now time.Time `json:"now,omitempty"`
 }
 
 func (f *ClusterFSM) applyReleaseStreamClaim(payload []byte) interface{} {
@@ -1226,7 +1908,7 @@ func (f *ClusterFSM) applyReleaseStreamClaim(payload []byte) interface{} {
 	if c.Done {
 		return fmt.Errorf("release stream claim: claim %d of %s is finished", p.Epoch, instKey(p.Instance))
 	}
-	c.Released = true
+	c.Released, c.EndedAt = true, p.Now
 	f.logger.Warn().Str("instance", instKey(p.Instance)).Str("by", c.By).Msg("Stream claim released; another writer may take the instance over")
 	return nil
 }
@@ -1265,8 +1947,8 @@ func (f *ClusterFSM) applyExtendStreamClaim(payload []byte, logIndex uint64) int
 			return errors.New("extend stream claim: a claimed key is malformed or over its bound")
 		}
 		s := normalized(v)
-		if ki := t.index[p.Instance][k]; ki != nil && ki.Floor > 0 {
-			s = s.minus(Intervals{{0, ki.Floor}}.minus(ki.Lost))
+		if ki := t.index[p.Instance][k]; ki != nil {
+			s = s.minus(ki.floorSettledSet())
 		}
 		if len(s) == 0 {
 			continue
@@ -1333,14 +2015,12 @@ func (f *ClusterFSM) applyInstanceSettled(payload []byte) interface{} {
 func (f *ClusterFSM) takeoverNodeRemovedLocked(id string) {
 	t := f.takeover
 	t.gen++
+	delete(t.departed, id) // before the report sweep below: it no longer waits for this node
 	for _, inst := range sortedInstanceIDs(t.instances) {
 		in := t.instances[inst]
-		if in.Origin == id {
+		if in.Origin == id && in.Status != InstanceRetired {
 			in.OriginGone = true
 			in.Status, in.AdoptedBy = InstanceOrphaned, 0
-			if c := t.claims[inst]; c != nil && c.Done {
-				f.removeInstanceLocked(inst)
-			}
 		}
 	}
 	delete(t.current, id)
@@ -1358,6 +2038,80 @@ func (f *ClusterFSM) takeoverNodeRemovedLocked(id string) {
 				Msg("Stream claim released: its claimant was removed from the cluster")
 		}
 	}
+}
+
+// maxDepartedWriters bounds the departures kept; past it a leave is applied
+// as an operator removal (instances orphaned, claims released).
+const maxDepartedWriters = 256
+
+// takeoverNodeDepartedLocked records a graceful leave of a writer: its
+// instances and claims stay as they are (a restart re-joins and adopts its
+// instances first), so it is not treated as gone. Caller holds f.mu.
+func (f *ClusterFSM) takeoverNodeDepartedLocked(id string, at time.Time) {
+	t := f.takeover
+	if _, ok := t.departed[id]; !ok && len(t.departed) >= maxDepartedWriters {
+		// Full: the departure most likely never to return goes, the oldest
+		// (ties by id, so every node picks the same).
+		oldest := ""
+		for d, at := range t.departed {
+			if oldest == "" || at.Before(t.departed[oldest]) || (at.Equal(t.departed[oldest]) && d < oldest) {
+				oldest = d
+			}
+		}
+		f.logger.Error().Str("node_id", oldest).Int("departed", len(t.departed)).
+			Msg("Too many writers have left the cluster without coming back; the oldest departure is removed from stream takeover as an operator removal would")
+		f.takeoverNodeRemovedLocked(oldest)
+	}
+	t.gen++
+	t.departed[id] = at
+}
+
+// takeoverNodeBackLocked forgets a departure: the node re-joined. Back in
+// another role than writer it will never announce again: its instances are
+// given up as on an operator removal.
+func (f *ClusterFSM) takeoverNodeBackLocked(id, role string) {
+	t := f.takeover
+	if t == nil {
+		return
+	}
+	if _, ok := t.departed[id]; ok {
+		delete(t.departed, id)
+		t.gen++
+	}
+	if role == "writer" || !f.streamClaims {
+		return
+	}
+	for _, in := range t.instances {
+		if in.Origin == id && !in.OriginGone {
+			f.takeoverNodeRemovedLocked(id)
+			return
+		}
+	}
+}
+
+// CurrentInstanceClaimed reports whether origin's current instance has an
+// active claim, finished or not: that process exits for a restart (its next
+// instance is not claimed).
+func (f *ClusterFSM) CurrentInstanceClaimed(origin string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	inst, ok := f.takeover.current[origin]
+	if !ok {
+		return false
+	}
+	return f.takeover.claims[inst].active()
+}
+
+// DepartedWriters returns the writers that left gracefully and have not
+// re-joined, with their departure time.
+func (f *ClusterFSM) DepartedWriters() map[string]time.Time {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make(map[string]time.Time, len(f.takeover.departed))
+	for id, at := range f.takeover.departed {
+		out[id] = at
+	}
+	return out
 }
 
 // ---- read access ----
@@ -1398,6 +2152,8 @@ type InstanceState struct {
 	Claimed      bool // a claim exists (any state)
 	ClaimDone    bool
 	ClaimRelease bool
+	// Finished: writers that finished a claim of it.
+	Finished []string
 }
 
 // TakeoverInstanceStates returns the state of every known instance.
@@ -1409,6 +2165,10 @@ func (f *ClusterFSM) TakeoverInstanceStates() map[uint64]InstanceState {
 		st := InstanceState{Origin: in.Origin, Status: in.Status, Untracked: in.Untracked}
 		if c := f.takeover.claims[id]; c != nil {
 			st.Claimed, st.ClaimDone, st.ClaimRelease = true, c.Done, c.Released
+			st.Finished = append([]string(nil), c.FinishedBy...)
+			if c.Done {
+				st.Finished = append(st.Finished, c.By)
+			}
 		}
 		out[id] = st
 	}
@@ -1458,14 +2218,9 @@ func (f *ClusterFSM) CoveredRows(inst uint64, key string, cseq uint64, chunk, ch
 	if ki == nil {
 		return CoveredRanges, nil, 0, nil
 	}
-	if cseq <= ki.Floor && !ki.Lost.contains(cseq) {
-		return CoveredAll, nil, 0, nil
-	}
-	h := ki.Hours[hour.UTC().Truncate(time.Hour).Unix()]
-	if h == nil {
-		return CoveredRanges, nil, 0, nil
-	}
-	if h.Whole.contains(cseq) {
+	hr := hour.UTC().Truncate(time.Hour).Unix()
+	h := ki.Hours[hr]
+	if h != nil && h.Whole.contains(cseq) {
 		return CoveredAll, nil, 0, nil
 	}
 	chunked := chunks > 1
@@ -1474,6 +2229,43 @@ func (f *ClusterFSM) CoveredRows(inst uint64, key string, cseq uint64, chunk, ch
 	}
 	var ranges [][2]int
 	total := -1
+	if ki.floorSettled(cseq) {
+		// Every row is in a file, except the rows of vanished pieces here.
+		whole, lost := ki.lostPieces(cseq, hr)
+		if !whole {
+			var gone [][2]int
+			for _, q := range lost {
+				if (q.Chunks > 0) != chunked {
+					return CoveredRanges, nil, 0, fmt.Errorf("batch %d of %s vanished in other row coordinates", cseq, key)
+				}
+				if chunked && q.Chunk != chunk {
+					continue
+				}
+				if q.RowTotal == 0 {
+					whole = true // the whole chunk
+					break
+				}
+				if total >= 0 && q.RowTotal != total {
+					return CoveredRanges, nil, 0, fmt.Errorf("batch %d of %s vanished with differing row totals", cseq, key)
+				}
+				total = q.RowTotal
+				gone = append(gone, [2]int{q.RowLo, q.RowHi})
+			}
+			if !whole {
+				if len(gone) == 0 {
+					return CoveredAll, nil, 0, nil
+				}
+				sort.Slice(gone, func(i, j int) bool { return gone[i][0] < gone[j][0] })
+				ranges = complementRanges(gone, total)
+			}
+		}
+	}
+	if h == nil {
+		if total < 0 {
+			return CoveredRanges, nil, 0, nil
+		}
+		return CoveredRanges, ranges, total, nil
+	}
 	for _, q := range h.Partial {
 		if q.CSeq != cseq {
 			continue
@@ -1647,10 +2439,21 @@ func (f *ClusterFSM) CoverageCovered(inst uint64, key string, p CoveragePiece, h
 	if ki == nil {
 		return false
 	}
-	if p.CSeq <= ki.Floor && !ki.Lost.contains(p.CSeq) {
-		return true
+	hr := hour.UTC().Truncate(time.Hour).Unix()
+	h := ki.Hours[hr]
+	if ki.floorSettled(p.CSeq) {
+		whole, lost := ki.lostPieces(p.CSeq, hr)
+		if !whole {
+			// Covered unless a vanished piece overlapping p is not
+			// republished (conservative: the whole vanished piece).
+			for _, q := range lost {
+				if piecesOverlap(p, q) && !(h != nil && (h.Whole.contains(q.CSeq) || piecesCover(h.samePieces(q.CSeq), q))) {
+					return false
+				}
+			}
+			return true
+		}
 	}
-	h := ki.Hours[hour.UTC().Truncate(time.Hour).Unix()]
 	if h == nil {
 		return false
 	}
@@ -1788,10 +2591,12 @@ func (f *ClusterFSM) UncoveredBatches(inst uint64, key string, lo, hi uint64, ho
 	if ki == nil {
 		return all
 	}
+	hr := hour.UTC().Truncate(time.Hour).Unix()
 	if ki.Floor >= lo {
-		all = all.minus(Intervals{{lo, minU64(hi, ki.Floor)}}.minus(ki.Lost))
+		// A batch with a vanished piece here counts as uncovered.
+		all = all.minus(Intervals{{lo, minU64(hi, ki.Floor)}}.minus(ki.Lost).minus(ki.lostBatches(hr)))
 	}
-	if h := ki.Hours[hour.UTC().Truncate(time.Hour).Unix()]; h != nil {
+	if h := ki.Hours[hr]; h != nil {
 		all = all.minus(h.Whole.clip(lo, hi))
 	}
 	return all

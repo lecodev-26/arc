@@ -129,13 +129,7 @@ func (s *Store) Received(origin string, instance uint64) map[string][][2]uint64 
 	}
 	out := map[string][][2]uint64{}
 	for key, k := range d.keys {
-		var have intervalSet
-		for _, seg := range d.segs {
-			for _, iv := range seg.cseqs[key] {
-				have = have.withRange(iv[0], iv[1])
-			}
-		}
-		have = have.clip(1, k.last).minus(k.gaps)
+		have := d.wholeLocked(key, k)
 		if d.floors != nil {
 			if kf, ok := d.floors.Keys[key]; ok {
 				have = have.minus(kf.registered())
@@ -146,6 +140,54 @@ func (s *Store) Received(origin string, instance uint64) map[string][][2]uint64 
 		}
 	}
 	return out
+}
+
+// Held returns, per key, the batches of an instance stored here received
+// whole, whatever the origin's floors say: a claimant asks the manifest what
+// of them is registered (#1207). Received is Held minus the floors.
+func (s *Store) Held(origin string, instance uint64) map[string][][2]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := s.instances[instanceID{origin, instance}]
+	if d == nil {
+		return nil
+	}
+	out := map[string][][2]uint64{}
+	for key, k := range d.keys {
+		if have := d.wholeLocked(key, k); len(have) > 0 {
+			out[key] = have
+		}
+	}
+	return out
+}
+
+// Registered returns, per key, the batches of an instance its origin's
+// floors (as last received) say are in a registered file in every hour.
+func (s *Store) Registered(origin string, instance uint64) map[string][][2]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := s.instances[instanceID{origin, instance}]
+	if d == nil || d.floors == nil {
+		return nil
+	}
+	out := map[string][][2]uint64{}
+	for key, kf := range d.floors.Keys {
+		if r := kf.registered(); len(r) > 0 {
+			out[key] = r
+		}
+	}
+	return out
+}
+
+// wholeLocked is the batches of key stored and received whole.
+func (d *instanceDir) wholeLocked(key string, k *keyState) intervalSet {
+	var have intervalSet
+	for _, seg := range d.segs {
+		for _, iv := range seg.cseqs[key] {
+			have = have.withRange(iv[0], iv[1])
+		}
+	}
+	return have.clip(1, k.last).minus(k.gaps)
 }
 
 // Record is one stored record.
@@ -286,6 +328,7 @@ func readSegment(path string, off, size int64, fn func(Record, int64) bool) (sto
 // DropInstance removes an instance and its records: a claimant does so once
 // its claim is finished and every file of it is held locally.
 func (s *Store) DropInstance(origin string, instance uint64) error {
+	defer s.drainUnlink() // after the lock below is released
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := instanceID{origin, instance}
@@ -293,6 +336,7 @@ func (s *Store) DropInstance(origin string, instance uint64) error {
 	if d == nil {
 		return nil
 	}
+	s.forgetLocked(d, d.segs...)
 	if d.cur != nil {
 		_ = d.cur.Close()
 		d.cur = nil
@@ -301,11 +345,12 @@ func (s *Store) DropInstance(origin string, instance uint64) error {
 	for _, seg := range d.segs {
 		freed += seg.size
 	}
-	if err := os.RemoveAll(d.dir); err != nil {
+	if err := s.removeLocked(d.dir); err != nil {
 		return fmt.Errorf("standby store: drop instance: %w", err)
 	}
+	delete(s.pendingFloors, d)
 	d.segs = nil // a trim pass holding this dir must not free its bytes again
-	syncDir(filepath.Dir(d.dir))
+	s.dirsToSync[filepath.Dir(d.dir)] = true
 	delete(s.instances, id)
 	s.bytes -= freed
 	s.publishLocked()
